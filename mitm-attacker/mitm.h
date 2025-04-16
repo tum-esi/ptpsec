@@ -57,6 +57,16 @@ struct res_time_head res_time_meas;
  */
 struct pi_servo *servo;
 
+/*
+ * Pseudo header data structure for UDP checksum calculation 
+ */
+struct udp_pseudo_header {
+    u_int32_t source_address;
+    u_int32_t dest_address;
+    u_int8_t placeholder;
+    u_int8_t protocol;
+    u_int16_t udp_length;
+};
 
 /*
  * PTP message types (event messages)

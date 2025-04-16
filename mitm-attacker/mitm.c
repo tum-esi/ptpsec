@@ -45,7 +45,7 @@
 #define PORT_0 0
 #define PORT_1 1
 
-// Timer helper variables
+// Helper variables to sync internal HW clocks
 uint64_t prev_tsc = 0, cur_tsc, diff_tsc;
 static uint64_t timer_resolution_cycles;
 static struct rte_timer sync_timer;
@@ -355,8 +355,8 @@ static int timestamp_event_message(uint16_t port, uint8_t msg_type, uint16_t seq
 			   " by hardware (Type: %d)\n",
 			   (unsigned)port, msg_type);
 
-		// rte_eth_tx_burst(port ^ 1, 0, bufs, 1);
-		return -1;
+		rte_eth_tx_burst(port ^ 1, 0, bufs, 1);
+		// return -1;
 	}
 	else
 	{
@@ -364,7 +364,7 @@ static int timestamp_event_message(uint16_t port, uint8_t msg_type, uint16_t seq
 		uint64_t rx_ts = *hwts_field(bufs[0]);
 
 		/* Add delay before forwarding packet */
-		if (delay > 0)	// if delay < 0: delay other message type (other direction)
+		if (delay > 0)	// if delay < 0: delay other message type
 			rte_delay_us(delay);
 		else
 			delay = 0;
@@ -452,6 +452,10 @@ static void update_correction_field(uint16_t port, uint16_t seq_id, struct ptpv2
 
 			break;
 		}
+		else
+		{
+			printf("Update Correction Field failed. No matching SeqId.\n");
+		}
 	}
 }
 
@@ -464,13 +468,16 @@ static __rte_noreturn void
 lcore_main(void)
 {
 	uint16_t port;
-	int64_t delay = 0; // us	(positive values delay SYNC messages, negative values delay D_REQ messages)
+	int64_t delay = 0; // us	(positive values delay D_REQ messages, negative values delay SYNC messages)
 
 	struct rte_mbuf *bufs[BURST_SIZE];
 	struct rte_ether_hdr *eth_hdr;
-	uint16_t eth_type;
+	struct rte_ipv4_hdr *ipv4_hdr;
+	struct rte_udp_hdr *udp_hdr;
 	struct ptpv21_msg *ptp_hdr;
 	struct meas_hdr *meas_hdr;
+
+	uint16_t eth_type;
 	uint16_t nb_tx;
 
 	struct list_head
@@ -519,8 +526,7 @@ lcore_main(void)
 		RTE_ETH_FOREACH_DEV(port)
 		{
 			/* Get burst of RX packets, from first port of pair. */
-			const uint16_t nb_rx = rte_eth_rx_burst(port, 0,
-													bufs, BURST_SIZE);
+			const uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
 
 			// Check whether we received at least one packet
 			if (unlikely(nb_rx == 0))
@@ -531,12 +537,62 @@ lcore_main(void)
 			eth_type = rte_be_to_cpu_16(eth_hdr->ether_type);
 
 			// Check for PTP packets
-			if (eth_type == RTE_ETHER_TYPE_1588)
+			if (eth_type == RTE_ETHER_TYPE_1588)	// PTP network transport: L2
 			{
 				// Get PTP header
-				ptp_hdr = (struct ptpv21_msg *)(rte_pktmbuf_mtod(bufs[0], char *) +
-												sizeof(struct rte_ether_hdr));
+				ptp_hdr = rte_pktmbuf_mtod_offset(bufs[0], struct ptpv21_msg *, sizeof(struct rte_ether_hdr));
 
+				ipv4_hdr = NULL;
+				udp_hdr = NULL;
+			}
+			else if (eth_type == RTE_ETHER_TYPE_IPV4)	// PTP network transport: UDPv4
+			{
+				// Get IPv4 header
+				ipv4_hdr = rte_pktmbuf_mtod_offset(bufs[0], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+
+				uint8_t ihl = ipv4_hdr->ihl;
+				uint8_t next_proto = ipv4_hdr->next_proto_id;
+
+				// uint32_t src_addr = rte_be_to_cpu_32(ipv4_hdr->src_addr);
+				// printf("IP Src: %08x (%u.%u.%u.%u), len: %u, proto: %u\n", src_addr, ((src_addr >> 3*8) & 0xFF), ((src_addr >> 2*8) & 0xFF), ((src_addr >> 1*8) & 0xFF), ((src_addr >> 0*8) & 0xFF), ihl, next_proto);
+
+				if((ihl == 5) && (next_proto == IPPROTO_UDP))	// I: len = 32bit * 5(ihl) = 20 Byte; II: proto = UDP (17)
+				{
+					// Get UDP header
+					udp_hdr = rte_pktmbuf_mtod_offset(bufs[0], struct rte_udp_hdr *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
+
+					uint16_t udp_src_port = rte_be_to_cpu_16(udp_hdr->src_port);
+					// printf("UDP Src: %u\n", udp_src_port);
+
+					if((udp_src_port == 319) || (udp_src_port == 320))	// PTP ports: 319, 320
+					{
+						// Get PTP header
+						ptp_hdr = rte_pktmbuf_mtod_offset(bufs[0], struct ptpv21_msg *, sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr));
+					}
+					else
+					{
+						printf("Unknown UDP src port used: %u\n", udp_src_port);
+						ptp_hdr = NULL;
+					}
+				}
+				else
+				{
+					printf("Unknown IP packet: Len=%u, Proto=%u\n", ihl, next_proto);
+					udp_hdr = NULL;
+					ptp_hdr = NULL;
+				}
+			}
+			else
+			{
+				// Not a (supported) PTP packet
+				ptp_hdr = NULL;
+				udp_hdr = NULL;
+				printf("ETH Type: 0x%04x\n", eth_type);
+			}
+
+			// Process valid PTP packets
+			if (ptp_hdr != NULL)
+			{
 				// Get some header fields
 				uint16_t seq_id = rte_be_to_cpu_16(ptp_hdr->seq_id);
 				uint8_t msg_type = ptp_hdr->msg_type;
@@ -545,12 +601,12 @@ lcore_main(void)
 				switch (msg_type)
 				{
 				case PTP_SYNC_MESSAGE:
-					if (timestamp_event_message(port, msg_type, seq_id, bufs, delay, &res_time_sync) < 0)
+					if (timestamp_event_message(port, msg_type, seq_id, bufs, -delay, &res_time_sync) < 0)
 						rte_pktmbuf_free(bufs[0]);
 					continue;
 
 				case PTP_DELAY_REQ_MESSAGE:
-					if (timestamp_event_message(port, msg_type, seq_id, bufs, -delay, &res_time_dreq) < 0)
+					if (timestamp_event_message(port, msg_type, seq_id, bufs, delay, &res_time_dreq) < 0)
 						rte_pktmbuf_free(bufs[0]);
 					continue;
 
@@ -566,6 +622,7 @@ lcore_main(void)
 					// Get PTP header
 					meas_hdr = (struct meas_hdr *)(rte_pktmbuf_mtod(bufs[0], char *) +
 												   sizeof(struct rte_ether_hdr) +
+												   // TODO: Consider UDPv4, i.e., account for IP and UDP header lengths
 												   sizeof(struct ptpv21_msg));
 					uint32_t meas_type = rte_be_to_cpu_16(meas_hdr->type);
 
@@ -588,9 +645,70 @@ lcore_main(void)
 
 					break;
 
+				case PTP_ANNOUNCE_MESSAGE:
+					// PTP messages that can be ignored for the attack
+					break;
+
 				default:
 					break;
 				}
+			}
+			else
+			{
+				printf("Invalid PTP Packet.\n");
+			}
+
+			// Update UDP checksum (if necessary)
+			if(udp_hdr != NULL)
+			{
+				/** Pseudo code for UDP checksum calculation 
+				 * 
+				 *    pseudo_header (12B) = source_ip (4B) + dest_ip (4B) + 0x00 (1B) + protocol (1B) + udp_length (2B)
+				 *    udp_header (8B) = source_port (2B) + dest_port (2B) + udp_length (2B) + 0x0000 (2B)
+				 *    udp_checksum (2B) = sum(pseudo_header + udp_header + udp_payload)
+				 */
+
+				// Get message lengths
+				uint16_t ptp_msg_len = 0;
+				if (ptp_hdr != NULL)
+					ptp_msg_len = rte_be_to_cpu_16(ptp_hdr->msg_len);
+				uint16_t udp_hdr_len = sizeof(struct rte_udp_hdr);
+				uint16_t udp_msg_len = ptp_msg_len + udp_hdr_len;
+
+				// Prepare pseudo header
+				struct udp_pseudo_header ph;	// All fields expected in Big Endian (BE)
+				ph.source_address = ipv4_hdr->src_addr;	// Already in Big Endian
+				ph.dest_address = ipv4_hdr->dst_addr;	// Already in Big Endian
+				ph.placeholder = 0x0;
+				ph.protocol = IPPROTO_UDP;
+				ph.udp_length = rte_cpu_to_be_16(udp_msg_len);
+
+				// Prepare UDP header
+				udp_hdr->dgram_cksum = 0x0;
+				udp_hdr->dgram_len = rte_be_to_cpu_16(udp_msg_len);
+				
+				// Prepare pseudo buffer for calculation
+				int psize = sizeof(struct udp_pseudo_header) + udp_msg_len;
+				unsigned char *pseudogram = malloc(psize);
+				memcpy(pseudogram, (unsigned char *) &ph, sizeof(struct udp_pseudo_header));
+				memcpy(pseudogram + sizeof(struct udp_pseudo_header), udp_hdr, udp_msg_len);
+
+				// Compute final checksum
+				unsigned short *buf = (unsigned short *) pseudogram;
+				unsigned int sum = 0;
+				unsigned short result;
+				int len = psize;
+				
+				for (sum = 0; len > 1; len -= 2)
+					sum += *buf++;
+				if (len == 1)
+					sum += *(unsigned char *)buf;
+				while (sum >> 16)
+					sum = (sum & 0xFFFF) + (sum >> 16);
+				result = ~sum;
+
+				// Update checksum in UDP header
+				udp_hdr->dgram_cksum = result;	// Result already in Big Endian 
 			}
 
 			/* Send burst of TX packets, to second port of pair. */
